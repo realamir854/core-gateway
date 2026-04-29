@@ -1,12 +1,13 @@
-// Run on Edge to keep response time low and closer to the user
 export const config = { runtime: "edge" };
 
-// Base target domain (comes from env)
-// trailing slash is trimmed to avoid double slashes when joining paths
-const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
+// normalize target once
+const BASE = (() => {
+  const raw = process.env.TARGET_DOMAIN || "";
+  return raw.endsWith("/") ? raw.slice(0, -1) : raw;
+})();
 
-// Headers that should never be forwarded (hop-by-hop or problematic)
-const STRIP_HEADERS = new Set([
+// hop-by-hop + unwanted headers
+const BLOCKED = new Set([
   "host",
   "connection",
   "keep-alive",
@@ -22,69 +23,64 @@ const STRIP_HEADERS = new Set([
   "x-forwarded-port",
 ]);
 
+function buildTargetUrl(inputUrl) {
+  const url = new URL(inputUrl);
+  return BASE + url.pathname + url.search;
+}
+
+function filterHeaders(inHeaders) {
+  const out = new Headers();
+  let ip = null;
+
+  for (const [key, value] of inHeaders.entries()) {
+    if (BLOCKED.has(key)) continue;
+    if (key.startsWith("x-vercel-")) continue;
+
+    if (key === "x-real-ip") {
+      ip = value;
+      continue;
+    }
+
+    if (key === "x-forwarded-for") {
+      if (!ip) ip = value;
+      continue;
+    }
+
+    out.append(key, value);
+  }
+
+  if (ip) out.set("x-forwarded-for", ip);
+
+  return out;
+}
+
+function shouldHaveBody(method) {
+  return !(method === "GET" || method === "HEAD");
+}
+
 export default async function handler(req) {
-  // fail fast if env is not set properly
-  if (!TARGET_BASE) {
-    return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
+  if (!BASE) {
+    return new Response("Missing TARGET_DOMAIN", { status: 500 });
   }
 
   try {
-    // find where the actual path starts (skip protocol + host)
-    const pathStart = req.url.indexOf("/", 8);
+    const target = buildTargetUrl(req.url);
+    const headers = filterHeaders(req.headers);
 
-    // rebuild destination URL based on incoming request
-    const targetUrl =
-      pathStart === -1
-        ? TARGET_BASE + "/"
-        : TARGET_BASE + req.url.slice(pathStart);
+    const init = {
+      method: req.method,
+      headers,
+      redirect: "manual",
+      duplex: "half",
+    };
 
-    // prepare outgoing headers (filtered copy of incoming ones)
-    const out = new Headers();
-    let clientIp = null;
-
-    for (const [k, v] of req.headers) {
-      // skip restricted headers
-      if (STRIP_HEADERS.has(k)) continue;
-
-      // ignore vercel internal headers
-      if (k.startsWith("x-vercel-")) continue;
-
-      // keep track of client IP for forwarding
-      if (k === "x-real-ip") {
-        clientIp = v;
-        continue;
-      }
-
-      if (k === "x-forwarded-for") {
-        if (!clientIp) clientIp = v;
-        continue;
-      }
-
-      // forward everything else as-is
-      out.set(k, v);
+    if (shouldHaveBody(req.method)) {
+      init.body = req.body;
     }
 
-    // reattach client IP if we have it
-    if (clientIp) out.set("x-forwarded-for", clientIp);
-
-    const method = req.method;
-
-    // only non-GET/HEAD requests may contain a body
-    const hasBody = method !== "GET" && method !== "HEAD";
-
-    // forward the request to target
-    return await fetch(targetUrl, {
-      method,
-      headers: out,
-      body: hasBody ? req.body : undefined,
-      duplex: "half", // needed for streaming in edge runtime
-      redirect: "manual", // don't auto-follow redirects
-    });
-  } catch (err) {
-    // log for debugging purposes
-    console.error("relay error:", err);
-
-    // generic fallback response
-    return new Response("Bad Gateway: Tunnel Failed", { status: 502 });
+    return await fetch(target, init);
+  } catch (e) {
+    console.error("proxy failure:", e);
+    return new Response("Upstream request failed", { status: 502 });
   }
 }
