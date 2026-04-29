@@ -1,6 +1,6 @@
 {
-  "version": 3,
-  "name": "vercel-test",
+  "version": 2,
+  "name": "core-gateway",
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/index" }
   ],
